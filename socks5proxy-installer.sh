@@ -74,6 +74,7 @@ function ask_creds() {
 
 function write_config() {
     print_green "Создание конфига 3proxy..."
+    USERS_LINE=$(paste -sd, $USERFILE)
     cat <<EOF > "$CONFIG_FILE"
 daemon
 nserver 8.8.8.8
@@ -82,7 +83,7 @@ maxconn 200
 nscache 65536
 timeouts 1 5 30 60 180 1800 15 60
 log /etc/3proxy/logs/3proxy.log D
-users $(cat $USERFILE | tr '\n' ',')
+users $USERS_LINE
 auth strong
 allow * *
 socks -p$PROXY_PORT -a -n -i0.0.0.0 -e0.0.0.0
@@ -174,7 +175,7 @@ function show_menu() {
 
 function udp_check() {
     print_green "Проверка поддержки UDP ASSOCIATE на SOCKS5 $PROXY_USER:$PROXY_PASS@127.0.0.1:$PROXY_PORT ..."
-    for i in {1..5}; do
+    for i in {1..3}; do
         python3 - <<EOF
 import sys, socket, socks, time
 server = '127.0.0.1'
@@ -194,6 +195,16 @@ EOF
     done
 }
 
+function open_port() {
+    if command -v ufw &>/dev/null && ufw status | grep -qw active; then
+        ufw allow $PROXY_PORT/tcp || true
+        ufw allow $PROXY_PORT/udp || true
+        print_green "Порт $PROXY_PORT открыт в UFW (TCP/UDP)"
+    else
+        print_green "UFW не активен — порт $PROXY_PORT не блокируется."
+    fi
+}
+
 function show_final_info() {
     IP=$(curl -4 -s ifconfig.me || curl -4 -s ipinfo.io/ip)
     print_green "\n=== SOCKS5 ПРОКСИ ГОТОВ! ==="
@@ -202,8 +213,8 @@ function show_final_info() {
     echo "Логин:     $PROXY_USER"
     echo "Пароль:    $PROXY_PASS"
     echo
-    print_green "→ Строка для Telegram:"
-    echo "socks5://$PROXY_USER:$PROXY_PASS@$IP:$PROXY_PORT"
+    print_green "→ Ссылка для Telegram:"
+    echo "tg://socks?server=$IP&port=$PROXY_PORT&user=$PROXY_USER&pass=$PROXY_PASS"
     echo
     print_green "→ Для curl:"
     echo "curl -x socks5h://$PROXY_USER:$PROXY_PASS@$IP:$PROXY_PORT https://api.ipify.org"
@@ -223,6 +234,7 @@ function first_install() {
     write_users
     write_config
     make_service
+    open_port
     reload_3proxy
     print_green "Прокси успешно установлен и запущен!"
     cp "$0" /usr/local/bin/socks5mgr
