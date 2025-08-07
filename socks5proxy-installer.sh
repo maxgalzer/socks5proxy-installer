@@ -29,16 +29,25 @@ function install_3proxy() {
 
     print_green "Клонируем и собираем 3proxy..."
     cd /tmp
+    rm -rf 3proxy
     git clone --depth=1 https://github.com/z3APA3A/3proxy.git
     cd 3proxy
     make -f Makefile.Linux
-    mkdir -p /usr/local/bin
-    cp ./src/3proxy /usr/local/bin/
+
+    # Копируем бинарник из src/ или bin/
+    if [[ -f ./src/3proxy ]]; then
+        cp ./src/3proxy /usr/local/bin/
+    elif [[ -f ./bin/3proxy ]]; then
+        cp ./bin/3proxy /usr/local/bin/
+    else
+        print_red "❌ Не найден собранный бинарник 3proxy. Проверьте ошибки make!"
+        exit 1
+    fi
+
     mkdir -p /etc/3proxy/logs
     mkdir -p /etc/3proxy/
     chmod +x /usr/local/bin/3proxy
-    cd ..
-    rm -rf 3proxy
+    cd ~
 }
 
 function ask_creds() {
@@ -118,6 +127,7 @@ function add_user() {
     echo
     echo "$NEW_USER:CL:$NEW_PASS" >> "$USERFILE"
     print_green "Пользователь $NEW_USER добавлен!"
+    write_config
     reload_3proxy
 }
 
@@ -126,6 +136,7 @@ function del_user() {
     if grep -q "^$DEL_USER:" "$USERFILE"; then
         grep -v "^$DEL_USER:" "$USERFILE" > "$USERFILE.tmp" && mv "$USERFILE.tmp" "$USERFILE"
         print_green "Пользователь $DEL_USER удалён!"
+        write_config
         reload_3proxy
     else
         print_red "Такого пользователя нет!"
