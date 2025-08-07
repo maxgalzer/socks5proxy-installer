@@ -36,7 +36,7 @@ log "Обновление системы и установка Dante..."
 apt update -y && apt install -y dante-server whois python3 python3-pip
 
 # --- Установка PAM-модуля ---
-if ! [ -f /lib/security/pam_pwdfile.so ]; then
+if ! [ -f /lib/security/pam_pwdfile.so ] && ! [ -f /usr/lib/x86_64-linux-gnu/security/pam_pwdfile.so ]; then
     log "Установка pam_pwdfile.so..."
     apt install -y libpam-pwdfile
 fi
@@ -108,6 +108,39 @@ cat > /etc/pam.d/sockd <<EOF
 auth required pam_pwdfile.so pwdfile $PASSWD_FILE
 account required pam_permit.so
 EOF
+
+# --- Автоматически создаём unit-файл sockd, если он отсутствует ---
+if ! systemctl list-unit-files | grep -q sockd.service; then
+  log "Создание systemd unit-файла для sockd..."
+  cat >/etc/systemd/system/sockd.service <<EOF
+[Unit]
+Description=Dante SOCKS daemon
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/sbin/sockd -f /etc/danted.conf
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl daemon-reload
+fi
+
+# --- Автоматически открываем порт для TCP/UDP в UFW или iptables ---
+log "Открытие порта $SOCKS_PORT для TCP и UDP..."
+
+if command -v ufw &>/dev/null; then
+    ufw allow $SOCKS_PORT/tcp || true
+    ufw allow $SOCKS_PORT/udp || true
+    log "Порт $SOCKS_PORT открыт в UFW для TCP/UDP."
+else
+    iptables -C INPUT -p tcp --dport $SOCKS_PORT -j ACCEPT 2>/dev/null || \
+        iptables -I INPUT -p tcp --dport $SOCKS_PORT -j ACCEPT
+    iptables -C INPUT -p udp --dport $SOCKS_PORT -j ACCEPT 2>/dev/null || \
+        iptables -I INPUT -p udp --dport $SOCKS_PORT -j ACCEPT
+    log "Порт $SOCKS_PORT открыт через iptables (TCP/UDP)."
+fi
 
 # --- systemd, рестарт ---
 systemctl enable --now sockd
