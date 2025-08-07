@@ -13,40 +13,52 @@ log "===== SOCKS5 Proxy Install Start: $(date) ====="
 # 1. Проверки
 [[ $EUID -ne 0 ]] && die "Скрипт запускается только от root (sudo -i)!"
 
-which 3proxy >/dev/null 2>&1 || {
+if ! command -v 3proxy >/dev/null 2>&1; then
   log "[Инфо] 3proxy не найден. Начинаю установку."
-  apt update && apt install -y build-essential wget curl make gcc libpam0g-dev git || die "apt install завершился с ошибкой!"
+  apt update && apt install -y build-essential wget curl make gcc libpam0g-dev git python3-pip || die "apt install завершился с ошибкой!"
   cd /tmp
   git clone --depth=1 https://github.com/z3APA3A/3proxy.git || die "Не удалось клонировать репозиторий 3proxy"
   cd 3proxy
   make -f Makefile.Linux || die "Не удалось скомпилировать 3proxy"
   mkdir -p /usr/local/3proxy/bin
-  cp src/3proxy /usr/local/3proxy/bin/ || die "Не удалось скопировать бинарник 3proxy"
+  if [[ -f bin/3proxy ]]; then
+    cp bin/3proxy /usr/local/3proxy/bin/ || die "Не удалось скопировать бинарник 3proxy"
+  elif [[ -f src/3proxy ]]; then
+    cp src/3proxy /usr/local/3proxy/bin/ || die "Не удалось скопировать бинарник 3proxy"
+  else
+    die "Не найден собранный бинарник 3proxy (bin/3proxy или src/3proxy)"
+  fi
   ln -sf /usr/local/3proxy/bin/3proxy /usr/bin/3proxy
   ok "3proxy установлен"
-}
+fi
 
 # 2. Запрос параметров
 read -p "Введите порт SOCKS5 [32126]: " PORT; PORT=${PORT:-32126}
-read -p "Введите логин (только латиница/цифры) [user]: " LOGIN; LOGIN=${LOGIN:-user}
+read -p "Введите логин (латиница/цифры) [user]: " LOGIN; LOGIN=${LOGIN:-user}
 read -sp "Введите пароль: " PASSWORD; echo
 [[ -z "$PASSWORD" ]] && die "Пароль не может быть пустым!"
 
-# 3. Генерация файла пользователей
+# 3. Генерация файла пользователей (plain-text)
 USERS_FILE="/usr/local/3proxy/socks5.users"
 mkdir -p /usr/local/3proxy
-echo "${LOGIN}:CL:${PASSWORD}" > "$USERS_FILE"
+if [[ ! -f "$USERS_FILE" ]]; then
+  echo "${LOGIN}:CL:${PASSWORD}" > "$USERS_FILE"
+else
+  grep -q "^$LOGIN:" "$USERS_FILE" && die "Пользователь $LOGIN уже существует! Удалите его перед повторной установкой или выберите другой логин."
+  echo "${LOGIN}:CL:${PASSWORD}" >> "$USERS_FILE"
+fi
 
-# 4. Генерация конфига
+# 4. Генерация конфига (plain-text users)
 CONF="/usr/local/3proxy/socks5.conf"
+USERS_LINE="users $(cat "$USERS_FILE" | paste -sd, -)"
 cat > "$CONF" <<EOF
-nscache          65536
-timeouts         1 5 30 60 180 1800 15 60
+nscache 65536
+timeouts 1 5 30 60 180 1800 15 60
 daemon
 log /var/log/3proxy.log D
 logformat "L%Y-%m-%d %H:%M:%S %N %p %E %U %C:%c %R:%r %O %I %h %T"
 auth strong
-users $(cat "$USERS_FILE" | sed 's/:CL:/:CL:/g' | paste -sd, -)
+$USERS_LINE
 allow *
 proxy -n -a -p${PORT} -i0.0.0.0 -e0.0.0.0 -6
 socks -n -a -p${PORT} -i0.0.0.0 -e0.0.0.0 -6
@@ -102,7 +114,8 @@ manage_users() {
         grep -q "^$NEWLOGIN:" "$USERS_FILE" && { log "Пользователь уже есть"; continue; }
         read -sp "Новый пароль: " NEWPASS; echo
         echo "${NEWLOGIN}:CL:${NEWPASS}" >> "$USERS_FILE"
-        sed -i "/^users /c\users $(cat "$USERS_FILE" | sed 's/:CL:/:CL:/g' | paste -sd, -)" "$CONF"
+        USERS_LINE="users $(cat "$USERS_FILE" | paste -sd, -)"
+        sed -i "/^users /c\\$USERS_LINE" "$CONF"
         systemctl restart 3proxy-socks5
         ok "Добавлен $NEWLOGIN"
         ;;
@@ -110,7 +123,8 @@ manage_users() {
         read -p "Логин для удаления: " DELL
         grep -q "^$DELL:" "$USERS_FILE" || { log "Нет такого"; continue; }
         sed -i "/^$DELL:/d" "$USERS_FILE"
-        sed -i "/^users /c\users $(cat "$USERS_FILE" | sed 's/:CL:/:CL:/g' | paste -sd, -)" "$CONF"
+        USERS_LINE="users $(cat "$USERS_FILE" | paste -sd, -)"
+        sed -i "/^users /c\\$USERS_LINE" "$CONF"
         systemctl restart 3proxy-socks5
         ok "Удалён $DELL"
         ;;
@@ -131,11 +145,10 @@ EXT_IP=$(curl -s ipv4.icanhazip.com || curl -s ipinfo.io/ip || echo "server_ip")
 
 # 9. Проверка TCP
 log "[Тест TCP] Проверяю работу SOCKS5 на TCP..."
-curl --socks5 $LOGIN:$PASSWORD@$EXT_IP:$PORT https://api.ipify.org --max-time 15 || {
-  log "[Ошибка] TCP SOCKS5 не отвечает или заблокирован."
-}
+curl --socks5 $LOGIN:$PASSWORD@$EXT_IP:$PORT https://api.ipify.org --max-time 15 || log "[Ошибка] TCP SOCKS5 не отвечает или заблокирован."
 
-# 10. Проверка UDP
+# 10. Проверка UDP (python3-pip нужен только для первой установки)
+pip3 install --quiet --disable-pip-version-check PySocks || true
 log "[Тест UDP] Проверяю работу UDP через socks (python test)..."
 python3 - <<END || log "[Ошибка] Не удалось проверить UDP SOCKS5"
 import socket, socks
@@ -143,7 +156,7 @@ try:
     s = socks.socksocket(socket.AF_INET, socket.SOCK_DGRAM)
     s.set_proxy(socks.SOCKS5, "$EXT_IP", $PORT, True, "$LOGIN", "$PASSWORD")
     s.sendto(b'test', ("1.1.1.1", 53))
-    print("[ОК] UDP-трафик через SOCKS5 отправлен (но на 100% работоспособность гарантии нет, смотри логи).")
+    print("[ОК] UDP-трафик через SOCKS5 отправлен (на 100% работоспособность гарантии нет, смотри логи).")
 except Exception as e:
     print("[ОШИБКА] UDP через SOCKS5 не работает: ", e)
 END
