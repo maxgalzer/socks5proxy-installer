@@ -97,7 +97,7 @@ function write_users() {
 function reload_3proxy() {
     systemctl daemon-reload
     systemctl restart 3proxy
-    sleep 1
+    sleep 2
 }
 
 function make_service() {
@@ -157,7 +157,7 @@ function show_menu() {
     echo "4) Перезапустить прокси"
     echo "5) Статус прокси"
     echo "6) Проверка UDP ASSOCIATE"
-    echo "7) Выйти"
+    echo "7) Выход"
     echo
     read -p "Ваш выбор: " CHOICE
     case $CHOICE in
@@ -174,23 +174,46 @@ function show_menu() {
 
 function udp_check() {
     print_green "Проверка поддержки UDP ASSOCIATE на SOCKS5 $PROXY_USER:$PROXY_PASS@127.0.0.1:$PROXY_PORT ..."
-    python3 - <<EOF
-import sys, socket, socks
-
+    for i in {1..5}; do
+        python3 - <<EOF
+import sys, socket, socks, time
 server = '127.0.0.1'
 port = int("$PROXY_PORT")
 user = "$PROXY_USER"
 password = "$PROXY_PASS"
-
 try:
     sock = socks.socksocket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.set_proxy(socks.SOCKS5, server, port, True, user, password)
-    sock.settimeout(5)
+    sock.settimeout(3)
     sock.sendto(b'\x00'*16, ("8.8.8.8", 53))
     print(">>> \033[92mUDP ASSOCIATE через SOCKS5 прошёл успешно!\033[0m")
 except Exception as e:
     print(">>> \033[91mUDP ASSOCIATE через SOCKS5 не работает: %s\033[0m" % e)
 EOF
+        sleep 1
+    done
+}
+
+function show_final_info() {
+    IP=$(curl -4 -s ifconfig.me || curl -4 -s ipinfo.io/ip)
+    print_green "\n=== SOCKS5 ПРОКСИ ГОТОВ! ==="
+    echo "IP сервера: $IP"
+    echo "Порт:      $PROXY_PORT"
+    echo "Логин:     $PROXY_USER"
+    echo "Пароль:    $PROXY_PASS"
+    echo
+    print_green "→ Строка для Telegram:"
+    echo "socks5://$PROXY_USER:$PROXY_PASS@$IP:$PROXY_PORT"
+    echo
+    print_green "→ Для curl:"
+    echo "curl -x socks5h://$PROXY_USER:$PROXY_PASS@$IP:$PROXY_PORT https://api.ipify.org"
+    echo
+    print_green "→ Для приложений/ботов (например, Telegram Desktop):"
+    echo "  Логин/пароль/IP/порт — заполняются как выше."
+    echo
+    print_green "Для управления прокси — команда:"
+    echo "  sudo socks5mgr"
+    echo "============================"
 }
 
 function first_install() {
@@ -205,10 +228,12 @@ function first_install() {
     cp "$0" /usr/local/bin/socks5mgr
     chmod +x /usr/local/bin/socks5mgr
 
-    # Проверка UDP сразу после установки:
+    print_green "Ждём старта прокси (3 секунды)..."
+    sleep 3
+
     udp_check
 
-    print_green "Для управления прокси введите: sudo socks5mgr"
+    show_final_info
 }
 
 # === Запуск ===
