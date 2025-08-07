@@ -1,231 +1,158 @@
-#!/bin/bash
-
+#!/usr/bin/env bash
 set -e
 
-# Цвета для красоты
-RED='\033[0;31m'; GREEN='\033[0;32m'; CYAN='\033[0;36m'; NC='\033[0m'
+LOGFILE="/var/log/socks5_installer.log"
+touch "$LOGFILE"
 
-log()   { echo -e "${CYAN}[INFO]${NC} $1"; }
-error() { echo -e "${RED}[ERROR]${NC} $1" >&2; }
-success() { echo -e "${GREEN}[OK]${NC} $1"; }
+function log() { echo -e "$1" | tee -a "$LOGFILE"; }
+function die() { log "\033[0;31m[ОШИБКА]\033[0m $1"; exit 1; }
+function ok()  { log "\033[0;32m[ОК]\033[0m $1"; }
 
-# Проверка платформы
-if ! command -v apt &>/dev/null; then
-    error "apt не найден! Требуется Ubuntu/Debian"
-    exit 1
-fi
+log "===== SOCKS5 Proxy Install Start: $(date) ====="
 
-# --- Сбор данных ---
-echo -e "${CYAN}=== Установка SOCKS5/UDP-прокси с управлением пользователями ===${NC}"
+# 1. Проверки
+[[ $EUID -ne 0 ]] && die "Скрипт запускается только от root (sudo -i)!"
 
-read -rp "Порт для SOCKS5 (по умолчанию 1080): " SOCKS_PORT
-SOCKS_PORT=${SOCKS_PORT:-1080}
-
-read -rp "Основной логин: " SOCKS_USER
-SOCKS_USER=${SOCKS_USER:-user}
-
-read -rp "Пароль для $SOCKS_USER (Enter — сгенерировать): " SOCKS_PASS
-SOCKS_PASS=${SOCKS_PASS:-$(openssl rand -hex 8)}
-
-PASSWD_FILE="/etc/sockd.passwd"
-DANTED_CONF="/etc/danted.conf"
-LOG_FILE="/var/log/danted.log"
-
-# --- Установка Dante ---
-log "Обновление системы и установка Dante..."
-apt update -y && apt install -y dante-server whois python3 python3-pip
-
-# --- Установка PAM-модуля ---
-if ! [ -f /lib/security/pam_pwdfile.so ] && ! [ -f /usr/lib/x86_64-linux-gnu/security/pam_pwdfile.so ]; then
-    log "Установка pam_pwdfile.so..."
-    apt install -y libpam-pwdfile
-fi
-
-touch "$PASSWD_FILE"
-chmod 600 "$PASSWD_FILE"
-
-# --- Генерация пользователей (хэш SHA-512) ---
-add_user() {
-    local user=$1
-    local pass=$2
-    if grep -q "^$user:" "$PASSWD_FILE"; then
-        error "Пользователь $user уже существует."
-        return 1
-    fi
-    echo "$user:$(mkpasswd -m sha-512 $pass)" >> "$PASSWD_FILE"
-    success "Добавлен пользователь $user"
+which 3proxy >/dev/null 2>&1 || {
+  log "[Инфо] 3proxy не найден. Начинаю установку."
+  apt update && apt install -y build-essential wget curl make gcc libpam0g-dev git || die "apt install завершился с ошибкой!"
+  cd /tmp
+  git clone --depth=1 https://github.com/z3APA3A/3proxy.git || die "Не удалось клонировать репозиторий 3proxy"
+  cd 3proxy
+  make -f Makefile.Linux || die "Не удалось скомпилировать 3proxy"
+  mkdir -p /usr/local/3proxy/bin
+  cp src/3proxy /usr/local/3proxy/bin/ || die "Не удалось скопировать бинарник 3proxy"
+  ln -sf /usr/local/3proxy/bin/3proxy /usr/bin/3proxy
+  ok "3proxy установлен"
 }
 
-remove_user() {
-    local user=$1
-    if ! grep -q "^$user:" "$PASSWD_FILE"; then
-        error "Пользователь $user не найден."
-        return 1
-    fi
-    sed -i "/^$user:/d" "$PASSWD_FILE"
-    success "Удалён пользователь $user"
-}
+# 2. Запрос параметров
+read -p "Введите порт SOCKS5 [32126]: " PORT; PORT=${PORT:-32126}
+read -p "Введите логин (только латиница/цифры) [user]: " LOGIN; LOGIN=${LOGIN:-user}
+read -sp "Введите пароль: " PASSWORD; echo
+[[ -z "$PASSWORD" ]] && die "Пароль не может быть пустым!"
 
-list_users() {
-    echo "Текущие пользователи:"
-    cut -d: -f1 "$PASSWD_FILE"
-}
+# 3. Генерация файла пользователей
+USERS_FILE="/usr/local/3proxy/socks5.users"
+mkdir -p /usr/local/3proxy
+echo "${LOGIN}:CL:${PASSWORD}" > "$USERS_FILE"
 
-random_creds() {
-    u="user$(openssl rand -hex 3)"
-    p="$(openssl rand -hex 8)"
-    echo "$u $p"
-}
-
-# Добавление основного пользователя
-add_user "$SOCKS_USER" "$SOCKS_PASS"
-
-# --- Генерация danted.conf ---
-cat >"$DANTED_CONF" <<EOF
-logoutput: $LOG_FILE
-
-internal: 0.0.0.0 port = $SOCKS_PORT
-external: $(hostname -I | awk '{print $1}')
-
-method: username none
-user.notprivileged: nobody
-
-client pass {
-    from: 0.0.0.0/0 to: 0.0.0.0/0
-    log: connect disconnect error
-}
-
-pass {
-    from: 0.0.0.0/0 to: 0.0.0.0/0
-    protocol: tcp udp
-    method: username
-    log: connect disconnect error
-}
+# 4. Генерация конфига
+CONF="/usr/local/3proxy/socks5.conf"
+cat > "$CONF" <<EOF
+nscache          65536
+timeouts         1 5 30 60 180 1800 15 60
+daemon
+log /var/log/3proxy.log D
+logformat "L%Y-%m-%d %H:%M:%S %N %p %E %U %C:%c %R:%r %O %I %h %T"
+auth strong
+users $(cat "$USERS_FILE" | sed 's/:CL:/:CL:/g' | paste -sd, -)
+allow *
+proxy -n -a -p${PORT} -i0.0.0.0 -e0.0.0.0 -6
+socks -n -a -p${PORT} -i0.0.0.0 -e0.0.0.0 -6
+flush
 EOF
 
-# --- PAM авторизация ---
-cat > /etc/pam.d/sockd <<EOF
-auth required pam_pwdfile.so pwdfile $PASSWD_FILE
-account required pam_permit.so
-EOF
+ok "Конфиг создан: $CONF"
 
-# --- Автоматически создаём unit-файл sockd, если он отсутствует ---
-if ! systemctl list-unit-files | grep -q sockd.service; then
-  log "Создание systemd unit-файла для sockd..."
-  cat >/etc/systemd/system/sockd.service <<EOF
+# 5. Systemd unit
+SERVICE="/etc/systemd/system/3proxy-socks5.service"
+cat > "$SERVICE" <<EOF
 [Unit]
-Description=Dante SOCKS daemon
+Description=3proxy SOCKS5 proxy
 After=network.target
 
 [Service]
 Type=simple
-ExecStart=/usr/sbin/sockd -f /etc/danted.conf
+ExecStart=/usr/bin/3proxy $CONF
+Restart=on-failure
 
 [Install]
 WantedBy=multi-user.target
 EOF
-  systemctl daemon-reload
-fi
 
-# --- Автоматически открываем порт для TCP/UDP в UFW или iptables ---
-log "Открытие порта $SOCKS_PORT для TCP и UDP..."
+systemctl daemon-reload
+systemctl enable --now 3proxy-socks5 || die "Не удалось запустить 3proxy как systemd unit"
 
-if command -v ufw &>/dev/null; then
-    ufw allow $SOCKS_PORT/tcp || true
-    ufw allow $SOCKS_PORT/udp || true
-    log "Порт $SOCKS_PORT открыт в UFW для TCP/UDP."
-else
-    iptables -C INPUT -p tcp --dport $SOCKS_PORT -j ACCEPT 2>/dev/null || \
-        iptables -I INPUT -p tcp --dport $SOCKS_PORT -j ACCEPT
-    iptables -C INPUT -p udp --dport $SOCKS_PORT -j ACCEPT 2>/dev/null || \
-        iptables -I INPUT -p udp --dport $SOCKS_PORT -j ACCEPT
-    log "Порт $SOCKS_PORT открыт через iptables (TCP/UDP)."
-fi
-
-# --- systemd, рестарт ---
-systemctl enable --now sockd
-sleep 1
-
-# --- Меню управления пользователями ---
-while true; do
-    echo -e "\n${CYAN}=== Управление пользователями SOCKS5 ===${NC}"
-    echo "1. Добавить пользователя"
-    echo "2. Удалить пользователя"
-    echo "3. Показать всех пользователей"
-    echo "4. Сгенерировать случайные логин+пароль"
-    echo "0. Продолжить установку"
-    read -rp "Выберите действие: " action
-    case $action in
-        1)
-            read -rp "Имя пользователя: " u
-            read -rp "Пароль (Enter — сгенерировать): " p
-            p=${p:-$(openssl rand -hex 8)}
-            add_user "$u" "$p"
-            ;;
-        2)
-            read -rp "Имя пользователя: " u
-            remove_user "$u"
-            ;;
-        3)
-            list_users
-            ;;
-        4)
-            creds=($(random_creds))
-            add_user "${creds[0]}" "${creds[1]}"
-            echo "Сгенерировано: ${creds[0]} : ${creds[1]}"
-            ;;
-        0) break ;;
-        *) echo "Неизвестная опция" ;;
-    esac
-done
-
-systemctl restart sockd
 sleep 2
 
-# --- Проверка работы (TCP/UDP) ---
-echo -e "\n${CYAN}Проверка работоспособности прокси...${NC}"
+# 6. Firewall
+if command -v ufw >/dev/null 2>&1; then
+  ufw allow ${PORT}/tcp || log "[warn] Не удалось открыть порт $PORT/tcp в ufw"
+  ufw allow ${PORT}/udp || log "[warn] Не удалось открыть порт $PORT/udp в ufw"
+fi
+if command -v firewall-cmd >/dev/null 2>&1; then
+  firewall-cmd --permanent --add-port=${PORT}/tcp
+  firewall-cmd --permanent --add-port=${PORT}/udp
+  firewall-cmd --reload
+fi
 
-python3 - <<EOF
-import socks, sys
+# 7. Управление пользователями
+manage_users() {
+  while true; do
+    echo "====== Управление пользователями ======"
+    echo "1. Добавить пользователя"
+    echo "2. Удалить пользователя"
+    echo "3. Показать пользователей"
+    echo "0. Продолжить"
+    read -p "Выберите действие: " CH
+    case $CH in
+      1)
+        read -p "Новый логин: " NEWLOGIN
+        grep -q "^$NEWLOGIN:" "$USERS_FILE" && { log "Пользователь уже есть"; continue; }
+        read -sp "Новый пароль: " NEWPASS; echo
+        echo "${NEWLOGIN}:CL:${NEWPASS}" >> "$USERS_FILE"
+        sed -i "/^users /c\users $(cat "$USERS_FILE" | sed 's/:CL:/:CL:/g' | paste -sd, -)" "$CONF"
+        systemctl restart 3proxy-socks5
+        ok "Добавлен $NEWLOGIN"
+        ;;
+      2)
+        read -p "Логин для удаления: " DELL
+        grep -q "^$DELL:" "$USERS_FILE" || { log "Нет такого"; continue; }
+        sed -i "/^$DELL:/d" "$USERS_FILE"
+        sed -i "/^users /c\users $(cat "$USERS_FILE" | sed 's/:CL:/:CL:/g' | paste -sd, -)" "$CONF"
+        systemctl restart 3proxy-socks5
+        ok "Удалён $DELL"
+        ;;
+      3)
+        log "Пользователи:\n$(cut -d: -f1 "$USERS_FILE")"
+        ;;
+      0) break;;
+      *) echo "?" ;;
+    esac
+  done
+}
+
+manage_users
+
+# 8. Получить внешний IP
+EXT_IP=$(curl -s ipv4.icanhazip.com || curl -s ipinfo.io/ip || echo "server_ip")
+[[ "$EXT_IP" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "Ошибка получения внешнего IP ($EXT_IP)"
+
+# 9. Проверка TCP
+log "[Тест TCP] Проверяю работу SOCKS5 на TCP..."
+curl --socks5 $LOGIN:$PASSWORD@$EXT_IP:$PORT https://api.ipify.org --max-time 15 || {
+  log "[Ошибка] TCP SOCKS5 не отвечает или заблокирован."
+}
+
+# 10. Проверка UDP
+log "[Тест UDP] Проверяю работу UDP через socks (python test)..."
+python3 - <<END || log "[Ошибка] Не удалось проверить UDP SOCKS5"
+import socket, socks
 try:
-    s = socks.socksocket()
-    s.set_proxy(socks.SOCKS5, "127.0.0.1", $SOCKS_PORT, True, "$SOCKS_USER", "$SOCKS_PASS")
-    s.settimeout(5)
-    s.connect(("1.1.1.1", 53))
-    s.sendall(b"\x00" * 4)
-    s.close()
-    print("SOCKS5 TCP/UDP OK")
+    s = socks.socksocket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.set_proxy(socks.SOCKS5, "$EXT_IP", $PORT, True, "$LOGIN", "$PASSWORD")
+    s.sendto(b'test', ("1.1.1.1", 53))
+    print("[ОК] UDP-трафик через SOCKS5 отправлен (но на 100% работоспособность гарантии нет, смотри логи).")
 except Exception as e:
-    print("FAIL:", e)
-    sys.exit(1)
-EOF
+    print("[ОШИБКА] UDP через SOCKS5 не работает: ", e)
+END
 
-# --- Информация о сервере и прокси ---
-PUBLIC_IP=$(curl -s https://api.ipify.org)
-HOST=$(curl -s https://ipinfo.io/hostname 2>/dev/null || hostname -f)
-[[ -z "$HOST" || "$HOST" == "localhost" ]] && HOST="$PUBLIC_IP"
-
-echo -e "\n${GREEN}=== Информация о вашем SOCKS5/UDP-прокси ===${NC}"
-echo -e "${CYAN}Адрес (host):${NC}   $HOST"
-echo -e "${CYAN}Порт:${NC}           $SOCKS_PORT"
-echo -e "${CYAN}Пользователи:${NC}"
-cut -d: -f1 "$PASSWD_FILE" | sed 's/^/    - /'
-echo -e "${CYAN}Файл паролей:${NC}   $PASSWD_FILE"
-echo -e "${CYAN}Конфиг:${NC}         $DANTED_CONF"
-echo -e "${CYAN}Лог-файл:${NC}       $LOG_FILE"
-echo -e "${CYAN}Статус сервиса:${NC} "
-systemctl status sockd --no-pager -l | grep -E 'Active:|Loaded:|Listen'
-
-echo -e "\n${CYAN}Telegram-ссылка для быстрого подключения:${NC}"
-echo -e "tg://socks?server=$HOST&port=$SOCKS_PORT&user=$SOCKS_USER&pass=$SOCKS_PASS"
-
-echo -e "\n${CYAN}Памятка:${NC}"
-echo "— Добавьте прокси в Telegram через эту ссылку"
-echo "— Можно использовать прокси в других приложениях (SOCKS5 + UDP)"
-echo "— Для новых юзеров/паролей просто перезапустите скрипт"
-echo "— Логи ошибок: $LOG_FILE"
-echo "— Управление: systemctl restart|status|stop sockd"
-echo
-success "Установка завершена!"
+# 11. Выдать tg:// ссылку
+log "=========="
+log "Ссылка для Telegram:"
+log "tg://socks?server=$EXT_IP&port=$PORT&user=$LOGIN&pass=$PASSWORD"
+log "=========="
+ok "Готово! Логи: $LOGFILE"
 
 exit 0
