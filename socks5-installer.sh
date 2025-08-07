@@ -17,6 +17,7 @@ if ! command -v 3proxy >/dev/null 2>&1; then
   log "[Инфо] 3proxy не найден. Начинаю установку."
   apt update && apt install -y build-essential wget curl make gcc libpam0g-dev git python3-pip || die "apt install завершился с ошибкой!"
   cd /tmp
+  rm -rf 3proxy
   git clone --depth=1 https://github.com/z3APA3A/3proxy.git || die "Не удалось клонировать репозиторий 3proxy"
   cd 3proxy
   make -f Makefile.Linux || die "Не удалось скомпилировать 3proxy"
